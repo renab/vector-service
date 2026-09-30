@@ -145,18 +145,60 @@ migration matrix, and the HTTP integration tests all run there and must not
 be skippable by build tag in the pipeline. See package 5, scope 5b and 5c,
 for the matrix entry points and the image-level verification commands.
 
-The GitHub Actions workflow (`.github/workflows/ci.yml`) runs three jobs:
+The GitHub Actions workflow (`.github/workflows/ci.yml`) runs four jobs:
 
 1. **Unit tests** — `go test ./...` (no database, no build tag).
 2. **Integration tests** — `go test -p 1 -tags=integration -v ./...`
    against a PostgreSQL 18 + pgvector 0.8.6 service container.
-3. **Container image** — builds the Dockerfile, provisions a canonical
-   database (roles, database, vector extension), runs the contract-level
-   verification script (`scripts/verify-image.sh`). The verification
-   containers use bridge networking with
+3. **Container image** — builds the Dockerfile with OCI source/revision
+   labels, provisions a canonical database (roles, database, vector
+   extension), runs the contract-level verification script
+   (`scripts/verify-image.sh`), and saves the verified image as a tar
+   artifact. The verification containers use bridge networking with
    `--add-host=host.docker.internal:host-gateway` to reach the PostgreSQL
    service container through the Docker host gateway. The script requires
    `VECTOR_SERVICE_IMAGE_TEST_DISPOSABLE=1` before performing any DDL.
+4. **GHCR publish** (master only) — requires the image job to succeed.
+   Downloads the verified image artifact (no second rebuild), authenticates
+   to GHCR using `GITHUB_TOKEN` with `packages:write` scope, and publishes
+   two tags:
+   - `sha-<commit>` — commit-addressed tag bound to a specific source commit.
+     The workflow resolves the tag via the OCI Registry HTTP API, verifies
+     artifact identity when the tag exists, and reads back the pushed tag
+     to confirm it matches the verified artifact. Protected against
+     accidental workflow overwrite; not protected against external writers.
+     Fails closed on registry or authentication errors.
+   - `stable` — mutable tag promoted to the latest successfully validated
+     master commit. Pushed after the SHA tag is verified or pushed, then
+     read back to confirm identity.
+
+### Triggers
+
+The workflow runs on:
+
+- **push** — every branch (including master).
+- **pull_request** — every pull request.
+- **workflow_dispatch** — manual trigger (available on master for manual
+  republish).
+
+### Concurrency
+
+- **master** — runs are serialized in a dedicated concurrency group with
+  `cancel-in-progress: false`. Active promotions cannot be canceled by
+  subsequent pushes or manual dispatches.
+- **other refs** — runs use per-ref concurrency groups with
+  `cancel-in-progress: true`. New commits cancel in-progress runs for the
+  same branch or PR.
+
+### Publish conditions
+
+The publish job runs only when:
+
+1. The image job succeeds (unit + integration + image verification passed).
+2. The ref is `refs/heads/master`.
+3. The event is `push` or `workflow_dispatch` (not `pull_request`).
+
+Pull requests and non-master branches never publish images.
 
 ---
 

@@ -4,10 +4,26 @@
 #   1. Unit tests (no database)
 #   2. Integration tests (PostgreSQL 18 + pgvector):
 #      isolation matrix, migration matrix, logging matrix
-#   3. Container image build
+#   3. Container image build and verification
+#   4. GHCR publish (master only: SHA tag + stable promotion)
 #
 # The integration matrix is release-critical: isolation, migration, and
 # logging tests run on every change, not only on scheduled runs.
+#
+# GHCR publish:
+#   - Only for master pushes or manual workflow_dispatch on master.
+#   - Publishes the exact locally verified image (not a second rebuild).
+#   - sha-<commit> tag is commit-addressed: the workflow verifies the pushed
+#     artifact matches the locally verified image by comparing config digests
+#     (rootfs identity) before promotion. Protected against accidental workflow
+#     overwrite; not protected against external writers (repository owners with
+#     packages:write may mutate any tag).
+#   - stable tag promoted after SHA tag verification.
+#   - Serialized master concurrency prevents concurrent workflow publishers.
+#     A newer master push may supersede (cancel) a pending run; only runs that
+#     actually execute publish create a SHA tag.
+#   - packages:write scope on GITHUB_TOKEN; fail closed on auth errors.
+#   - See docs/PUBLISHING.md for detailed semantics and known limitations.
 #
 # Technology pins (authoritative):
 #   - PostgreSQL: 18
@@ -18,13 +34,24 @@ name: CI
 
 on:
   push:
-    branches-ignore: []
   pull_request:
+  workflow_dispatch:
 
-# Cancel in-progress runs when a new commit is pushed to the same ref.
+# Serialize pushes and manual promotion for master with non-canceling
+# concurrency. Keep ordinary CI cancellation for safe paths (PRs, branches).
+#
+# Master concurrency: a newer push may supersede a pending run. The last
+# eligible run that actually executes (is not superseded) publishes its SHA
+# tag and promotes stable. Runs that are superseded never publish. Every run
+# that does execute publish creates its SHA tag.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && 'master' || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+# Least-privilege workflow permissions.
+# publish job overrides with packages: write.
+permissions:
+  contents: read
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────────
@@ -35,6 +62,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -72,6 +101,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -118,6 +149,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -125,7 +158,13 @@ jobs:
           go-version: "1.27.1"
 
       - name: Build container image
-        run: docker build -t vector-service:test .
+        # OCI labels: source repository and revision for publish verification.
+        run: >-
+          docker build
+          --label org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          --label org.opencontainers.image.revision=${{ github.sha }}
+          -t vector-service:test
+          .
 
       - name: Verify container image
         env:
@@ -133,3 +172,682 @@ jobs:
           PG_PORT: 55432
           VECTOR_SERVICE_IMAGE_TEST_DISPOSABLE: "1"
         run: bash scripts/verify-image.sh vector-service:test
+
+      - name: Save image artifact
+        # Save the verified image as a tar artifact for the publish job.
+        # The publish job loads this exact image — no second rebuild.
+        run: docker save vector-service:test -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector-service-image
+          path: image.tar
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # GHCR publish — SHA tag + stable promotion with verified-artifact flow
+  # ──────────────────────────────────────────────────────────────────────────
+  # Fail-closed best-effort flow for one serialized trusted publisher.
+  # Authentication: exchange GitHub credentials for scoped GHCR bearer token
+  # (OCI Registry V2 Token API). Do not send GITHUB_TOKEN as Bearer.
+  # Verification: compare remote manifest config digest against local image
+  # identity (docker inspect --format '{{.Id}}'). Fetch config blob to
+  # verify org.opencontainers.image.revision label.
+  # See docs/PUBLISHING.md for semantics and known limitations.
+  publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-latest
+    needs: [image]
+    if: >-
+      github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      packages: write
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vector-service-image
+
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Tag image for GHCR
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          docker tag vector-service:test \
+            ghcr.io/${OWNER}/vector-service:sha-${{ github.sha }} &&
+          docker tag vector-service:test \
+            ghcr.io/${OWNER}/vector-service:stable
+
+      - name: Capture local image identity
+        # Capture the local image config digest for later verification.
+        # docker inspect --format '{{.Id}}' returns sha256:<config-hash>
+        # which is the config blob digest — the authoritative artifact identity.
+        # This is the exact verified artifact — not a second rebuild.
+        run: |
+          IMAGE_ID=$(docker inspect --format='{{.Id}}' vector-service:test)
+          echo "LOCAL_CONFIG_DIGEST=${IMAGE_ID}" >> "$GITHUB_ENV"
+          echo "Local verified image config digest: ${IMAGE_ID}"
+
+      - name: Log in to GHCR
+        # Docker CLI login for docker push/pull operations.
+        # Separate from OCI Registry API bearer token authentication.
+        run: >-
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+          docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+
+      - name: Obtain OCI Registry bearer token
+        # Exchange GitHub credentials for a scoped GHCR bearer token.
+        # GHCR uses the OCI Registry V2 Token API. The token is scoped to
+        # the specific repository for pull and push operations.
+        # Do NOT send GITHUB_TOKEN directly as Bearer — it is not a valid
+        # OCI Registry V2 token.
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO="${OWNER}/vector-service"
+
+          TOKEN_RESPONSE=$(curl -s -f \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull,push" \
+            -u "${OWNER}:${{ secrets.GITHUB_TOKEN }}" 2>/dev/null) || {
+            echo "FAIL: Could not obtain GHCR bearer token (token API request failed)" >&2
+            exit 1
+          }
+
+          GHCR_TOKEN=$(echo "$TOKEN_RESPONSE" | python3 -c "
+          import json, sys
+          try:
+              data = json.load(sys.stdin)
+          except json.JSONDecodeError as e:
+              print(f'FAIL: invalid JSON from token API: {e}', file=sys.stderr)
+              sys.exit(1)
+          token = data.get('token', '')
+          if not token:
+              print('FAIL: empty token in token API response', file=sys.stderr)
+              sys.exit(1)
+          print(token)
+          " 2>/dev/null) || GHCR_TOKEN=""
+
+          if [ -z "$GHCR_TOKEN" ]; then
+            echo "FAIL: Failed to extract GHCR bearer token" >&2
+            exit 1
+          fi
+
+          echo "GHCR_TOKEN=${GHCR_TOKEN}" >> "$GITHUB_ENV"
+
+      - name: Resolve and verify SHA tag
+        # Resolve existing SHA tag via authenticated OCI Registry HTTP API.
+        # Distinguish MANIFEST_UNKNOWN (tag absent) from NAME_UNKNOWN (repo absent).
+        # Fail closed: any non-MANIFEST_UNKNOWN error stops the workflow.
+        # When tag exists, verify config digest identity and revision label.
+        # When repo is absent (NAME_UNKNOWN), bootstrap with staging tag.
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO="${OWNER}/vector-service"
+          TAG="sha-${{ github.sha }}"
+          MANIFEST_URL="https://ghcr.io/v2/${REPO}/manifests/${TAG}"
+
+          echo "Resolving SHA tag: ghcr.io/${REPO}:${TAG}"
+
+          # Fetch the manifest via authenticated OCI Registry HTTP API.
+          # Accept schema2 and OCI image manifest types.
+          # Capture response headers to validate Content-Type against body mediaType.
+          HTTP_STATUS=$(curl -s -D /tmp/manifest_headers.txt -o /tmp/manifest_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GHCR_TOKEN}" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+            "$MANIFEST_URL" 2>/dev/null) || {
+            echo "FAIL: HTTP request to registry failed (network/DNS/TLS error)" >&2
+            exit 1
+          }
+
+          case "$HTTP_STATUS" in
+            200)
+              echo "Tag exists (HTTP 200) — verifying artifact identity."
+
+              # Validate Content-Type header and body mediaType agree.
+              # Reject absent/unsupported/inconsistent header/body and index/list.
+              MANIFEST_PARSE=$(python3 -c "
+              import json, sys
+
+              ACCEPTED_MEDIA_TYPES = frozenset((
+                  'application/vnd.docker.distribution.manifest.v2+json',
+                  'application/vnd.oci.image.manifest.v1+json',
+              ))
+              REJECTED_MEDIA_TYPES = frozenset((
+                  'application/vnd.docker.distribution.manifest.list.v2+json',
+                  'application/vnd.oci.image.index.v1+json',
+              ))
+
+              def normalize_media_type(mt):
+                  if not mt:
+                      return ''
+                  return mt.strip().split(';')[0].strip().lower()
+
+              # Read and validate Content-Type from response headers.
+              try:
+                  with open('/tmp/manifest_headers.txt') as f:
+                      headers_raw = f.read()
+              except IOError as e:
+                  print(f'PARSE_ERROR: cannot read headers: {e}', file=sys.stderr)
+                  sys.exit(1)
+
+              content_type = ''
+              for line in headers_raw.splitlines():
+                  if line.lower().startswith('content-type:'):
+                      content_type = line.split(':', 1)[1].strip()
+                      break
+
+              header_mt = normalize_media_type(content_type)
+              if not header_mt:
+                  print('REJECTED: missing or empty Content-Type header', file=sys.stderr)
+                  sys.exit(1)
+              if header_mt in REJECTED_MEDIA_TYPES:
+                  print(f'REJECTED: unsupported Content-Type: {header_mt}', file=sys.stderr)
+                  sys.exit(1)
+              if header_mt not in ACCEPTED_MEDIA_TYPES:
+                  print(f'REJECTED: unexpected Content-Type: {header_mt}', file=sys.stderr)
+                  sys.exit(1)
+
+              # Parse manifest body.
+              try:
+                  with open('/tmp/manifest_response.json') as f:
+                      data = json.load(f)
+              except (json.JSONDecodeError, IOError) as e:
+                  print(f'PARSE_ERROR: {e}', file=sys.stderr)
+                  sys.exit(1)
+
+              # Body mediaType must be present and non-empty — no defaults.
+              body_mt_raw = data.get('mediaType')
+              if not body_mt_raw or not isinstance(body_mt_raw, str) or not body_mt_raw.strip():
+                  print('REJECTED: manifest body missing or empty mediaType', file=sys.stderr)
+                  sys.exit(1)
+
+              body_mt = normalize_media_type(body_mt_raw)
+
+              # Header Content-Type and body mediaType must agree.
+              if header_mt != body_mt:
+                  print(f'REJECTED: Content-Type ({header_mt}) != body mediaType ({body_mt})', file=sys.stderr)
+                  sys.exit(1)
+
+              # Reject manifest lists and indices — cannot verify single-artifact identity.
+              if body_mt in REJECTED_MEDIA_TYPES:
+                  print(f'REJECTED: unsupported manifest type: {body_mt}', file=sys.stderr)
+                  sys.exit(1)
+
+              # Accept Docker schema2 and OCI image manifests.
+              if body_mt not in ACCEPTED_MEDIA_TYPES:
+                  print(f'REJECTED: unexpected manifest type: {body_mt}', file=sys.stderr)
+                  sys.exit(1)
+
+              config = data.get('config', {})
+              digest = config.get('digest', '')
+              if not digest:
+                  print('REJECTED: no config digest in manifest', file=sys.stderr)
+                  sys.exit(1)
+
+              print(f'CONFIG_DIGEST={digest}')
+              " 2>/tmp/parse_err.txt) || {
+                PARSE_ERR=$(cat /tmp/parse_err.txt 2>/dev/null || echo "unknown parse error")
+                echo "FAIL: Could not parse manifest: ${PARSE_ERR}" >&2
+                exit 1
+              }
+
+              REMOTE_CONFIG_DIGEST=$(echo "$MANIFEST_PARSE" | grep '^CONFIG_DIGEST=' | cut -d= -f2)
+
+              if [ -z "$REMOTE_CONFIG_DIGEST" ]; then
+                echo "FAIL: No config digest extracted from manifest" >&2
+                exit 1
+              fi
+
+              # Verify config digest matches local verified artifact.
+              # Config digest identity includes rootfs diff IDs — stronger than label match.
+              if [ "$REMOTE_CONFIG_DIGEST" != "${LOCAL_CONFIG_DIGEST}" ]; then
+                echo "FAIL: SHA tag exists but config digest mismatch" >&2
+                echo "  Expected config digest: ${LOCAL_CONFIG_DIGEST}" >&2
+                echo "  Remote config digest: ${REMOTE_CONFIG_DIGEST}" >&2
+                exit 1
+              fi
+
+              # Fetch config blob to verify revision label.
+              CONFIG_URL="https://ghcr.io/v2/${REPO}/blobs/${REMOTE_CONFIG_DIGEST}"
+              CONFIG_HTTP=$(curl -s -o /tmp/config_blob.json -w "%{http_code}" \
+                -H "Authorization: Bearer ${GHCR_TOKEN}" \
+                "$CONFIG_URL" 2>/dev/null) || {
+                echo "FAIL: Could not fetch config blob" >&2
+                exit 1
+              }
+
+              if [ "$CONFIG_HTTP" != "200" ]; then
+                echo "FAIL: Could not fetch config blob (HTTP ${CONFIG_HTTP})" >&2
+                exit 1
+              fi
+
+              EXISTING_REV=$(python3 -c "
+              import json, sys
+              try:
+                  with open('/tmp/config_blob.json') as f:
+                      data = json.load(f)
+              except (json.JSONDecodeError, IOError) as e:
+                  print(f'PARSE_ERROR: {e}', file=sys.stderr)
+                  sys.exit(1)
+              labels = data.get('config', {}).get('Labels', {})
+              if not labels:
+                  print('MISSING: no Labels in config', file=sys.stderr)
+                  sys.exit(1)
+              rev = labels.get('org.opencontainers.image.revision', '')
+              if not rev:
+                  print('MISSING: no org.opencontainers.image.revision label', file=sys.stderr)
+                  sys.exit(1)
+              print(rev)
+              " 2>/tmp/rev_err.txt) || {
+                REV_ERR=$(cat /tmp/rev_err.txt 2>/dev/null || echo "unknown error")
+                echo "FAIL: Could not extract revision from config blob: ${REV_ERR}" >&2
+                exit 1
+              }
+
+              if [ "$EXISTING_REV" = "${{ github.sha }}" ]; then
+                echo "SHA tag exists with matching config digest and revision — skipping push."
+                echo "SHA_TAG_EXISTS=true" >> "$GITHUB_ENV"
+              else
+                echo "FAIL: SHA tag exists but revision mismatch" >&2
+                echo "  Expected revision: ${{ github.sha }}" >&2
+                echo "  Existing revision: ${EXISTING_REV}" >&2
+                exit 1
+              fi
+              ;;
+            404)
+              # Parse error body to distinguish MANIFEST_UNKNOWN from NAME_UNKNOWN.
+              ERROR_CODE=$(python3 -c "
+              import json, sys
+              try:
+                  with open('/tmp/manifest_response.json') as f:
+                      data = json.load(f)
+                  errors = data.get('errors', [])
+                  if errors:
+                      print(errors[0].get('code', ''))
+                  else:
+                      print('')
+              except:
+                  print('')
+              " 2>/dev/null) || ERROR_CODE=""
+
+              if [ "$ERROR_CODE" = "MANIFEST_UNKNOWN" ]; then
+                echo "Tag does not exist (MANIFEST_UNKNOWN) — will push."
+              elif [ "$ERROR_CODE" = "NAME_UNKNOWN" ]; then
+                # Repository does not exist — bootstrap with a unique staging tag
+                # to create the package before pushing the SHA tag.
+                STAGING_TAG="staging-${{ github.run_id }}-${{ github.run_attempt }}"
+                echo "Repository does not exist (NAME_UNKNOWN) — creating with staging tag: ${STAGING_TAG}"
+
+                docker tag vector-service:test \
+                  "ghcr.io/${OWNER}/vector-service:${STAGING_TAG}" &&
+                docker push "ghcr.io/${OWNER}/vector-service:${STAGING_TAG}"
+
+                echo "STAGING_TAG=${STAGING_TAG}" >> "$GITHUB_ENV"
+                echo "Repository created — will push SHA tag."
+              else
+                # 404 without expected error code — fail closed.
+                echo "FAIL: Unexpected 404 response from registry (error code: '${ERROR_CODE}')" >&2
+                exit 1
+              fi
+              ;;
+            401)
+              echo "FAIL: Registry authentication failed (HTTP 401)" >&2
+              exit 1
+              ;;
+            403)
+              echo "FAIL: Registry access denied (HTTP 403)" >&2
+              exit 1
+              ;;
+            429)
+              echo "FAIL: Registry rate limited (HTTP 429)" >&2
+              exit 1
+              ;;
+            5*)
+              echo "FAIL: Registry server error (HTTP ${HTTP_STATUS})" >&2
+              exit 1
+              ;;
+            *)
+              echo "FAIL: Unexpected HTTP status ${HTTP_STATUS} from registry" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Push SHA tag
+        if: env.SHA_TAG_EXISTS != 'true'
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO="${OWNER}/vector-service"
+          TAG="sha-${{ github.sha }}"
+          IMAGE="ghcr.io/${OWNER}/vector-service:${TAG}"
+
+          echo "Pushing SHA tag: ${IMAGE}"
+          docker push "${IMAGE}"
+
+          # After push, read back the tag via OCI Registry API and verify
+          # config digest identity and revision label.
+          echo "Verifying pushed SHA tag..."
+
+          MANIFEST_URL="https://ghcr.io/v2/${REPO}/manifests/${TAG}"
+          # Capture response headers to validate Content-Type against body mediaType.
+          HTTP_STATUS=$(curl -s -D /tmp/pushed_headers.txt -o /tmp/pushed_manifest.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GHCR_TOKEN}" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+            "$MANIFEST_URL" 2>/dev/null) || {
+            echo "FAIL: Could not read back pushed SHA tag" >&2
+            exit 1
+          }
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "FAIL: Could not read back pushed SHA tag (HTTP ${HTTP_STATUS})" >&2
+            exit 1
+          fi
+
+          # Validate Content-Type header and body mediaType agree.
+          # Reject absent/unsupported/inconsistent header/body and index/list.
+          PUSHED_CONFIG_DIGEST=$(python3 -c "
+          import json, sys
+
+          ACCEPTED_MEDIA_TYPES = frozenset((
+              'application/vnd.docker.distribution.manifest.v2+json',
+              'application/vnd.oci.image.manifest.v1+json',
+          ))
+          REJECTED_MEDIA_TYPES = frozenset((
+              'application/vnd.docker.distribution.manifest.list.v2+json',
+              'application/vnd.oci.image.index.v1+json',
+          ))
+
+          def normalize_media_type(mt):
+              if not mt:
+                  return ''
+              return mt.strip().split(';')[0].strip().lower()
+
+          # Read and validate Content-Type from response headers.
+          try:
+              with open('/tmp/pushed_headers.txt') as f:
+                  headers_raw = f.read()
+          except IOError as e:
+              print(f'PARSE_ERROR: cannot read headers: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          content_type = ''
+          for line in headers_raw.splitlines():
+              if line.lower().startswith('content-type:'):
+                  content_type = line.split(':', 1)[1].strip()
+                  break
+
+          header_mt = normalize_media_type(content_type)
+          if not header_mt:
+              print('REJECTED: missing or empty Content-Type header', file=sys.stderr)
+              sys.exit(1)
+          if header_mt in REJECTED_MEDIA_TYPES:
+              print(f'REJECTED: unsupported Content-Type: {header_mt}', file=sys.stderr)
+              sys.exit(1)
+          if header_mt not in ACCEPTED_MEDIA_TYPES:
+              print(f'REJECTED: unexpected Content-Type: {header_mt}', file=sys.stderr)
+              sys.exit(1)
+
+          # Parse manifest body.
+          try:
+              with open('/tmp/pushed_manifest.json') as f:
+                  data = json.load(f)
+          except (json.JSONDecodeError, IOError) as e:
+              print(f'PARSE_ERROR: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          # Body mediaType must be present and non-empty — no defaults.
+          body_mt_raw = data.get('mediaType')
+          if not body_mt_raw or not isinstance(body_mt_raw, str) or not body_mt_raw.strip():
+              print('REJECTED: manifest body missing or empty mediaType', file=sys.stderr)
+              sys.exit(1)
+
+          body_mt = normalize_media_type(body_mt_raw)
+
+          # Header Content-Type and body mediaType must agree.
+          if header_mt != body_mt:
+              print(f'REJECTED: Content-Type ({header_mt}) != body mediaType ({body_mt})', file=sys.stderr)
+              sys.exit(1)
+
+          # Reject manifest lists and indices — cannot verify single-artifact identity.
+          if body_mt in REJECTED_MEDIA_TYPES:
+              print(f'REJECTED: unsupported manifest type: {body_mt}', file=sys.stderr)
+              sys.exit(1)
+
+          # Accept Docker schema2 and OCI image manifests.
+          if body_mt not in ACCEPTED_MEDIA_TYPES:
+              print(f'REJECTED: unexpected manifest type: {body_mt}', file=sys.stderr)
+              sys.exit(1)
+
+          config = data.get('config', {})
+          digest = config.get('digest', '')
+          if not digest:
+              print('REJECTED: no config digest in manifest', file=sys.stderr)
+              sys.exit(1)
+          print(digest)
+          " 2>/tmp/push_parse_err.txt) || {
+            PUSH_PARSE_ERR=$(cat /tmp/push_parse_err.txt 2>/dev/null || echo "unknown parse error")
+            echo "FAIL: Could not parse pushed manifest: ${PUSH_PARSE_ERR}" >&2
+            exit 1
+          }
+
+          if [ -z "$PUSHED_CONFIG_DIGEST" ]; then
+            echo "FAIL: No config digest in pushed manifest" >&2
+            exit 1
+          fi
+
+          if [ "$PUSHED_CONFIG_DIGEST" != "${LOCAL_CONFIG_DIGEST}" ]; then
+            echo "FAIL: Pushed SHA tag config digest mismatch" >&2
+            echo "  Expected (local): ${LOCAL_CONFIG_DIGEST}" >&2
+            echo "  Pushed: ${PUSHED_CONFIG_DIGEST}" >&2
+            exit 1
+          fi
+
+          # Fetch config blob and verify revision label.
+          CONFIG_URL="https://ghcr.io/v2/${REPO}/blobs/${PUSHED_CONFIG_DIGEST}"
+          curl -s -f -o /tmp/pushed_config.json \
+            -H "Authorization: Bearer ${GHCR_TOKEN}" \
+            "$CONFIG_URL" || {
+            echo "FAIL: Could not fetch config blob of pushed SHA tag" >&2
+            exit 1
+          }
+
+          PUSHED_REV=$(python3 -c "
+          import json, sys
+          try:
+              with open('/tmp/pushed_config.json') as f:
+                  data = json.load(f)
+          except (json.JSONDecodeError, IOError) as e:
+              print(f'PARSE_ERROR: {e}', file=sys.stderr)
+              sys.exit(1)
+          labels = data.get('config', {}).get('Labels', {})
+          if not labels:
+              print('MISSING: no Labels in config', file=sys.stderr)
+              sys.exit(1)
+          rev = labels.get('org.opencontainers.image.revision', '')
+          if not rev:
+              print('MISSING: no org.opencontainers.image.revision label', file=sys.stderr)
+              sys.exit(1)
+          print(rev)
+          " 2>/tmp/pushed_rev_err.txt) || {
+            PUSHED_REV_ERR=$(cat /tmp/pushed_rev_err.txt 2>/dev/null || echo "unknown error")
+            echo "FAIL: Could not extract revision from pushed config blob: ${PUSHED_REV_ERR}" >&2
+            exit 1
+          }
+
+          if [ "$PUSHED_REV" != "${{ github.sha }}" ]; then
+            echo "FAIL: Pushed SHA tag revision mismatch" >&2
+            echo "  Expected: ${{ github.sha }}" >&2
+            echo "  Pushed: ${PUSHED_REV}" >&2
+            exit 1
+          fi
+
+          echo "Pushed SHA tag verified: config_digest=${PUSHED_CONFIG_DIGEST} revision=${PUSHED_REV}"
+
+      - name: Promote stable tag
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO="${OWNER}/vector-service"
+          IMAGE="ghcr.io/${OWNER}/vector-service:stable"
+
+          echo "Promoting stable tag: ${IMAGE}"
+          docker push "${IMAGE}"
+
+          # After push, read back the stable tag via OCI Registry API and verify
+          # config digest identity and revision label.
+          echo "Verifying promoted stable tag..."
+
+          MANIFEST_URL="https://ghcr.io/v2/${REPO}/manifests/stable"
+          # Capture response headers to validate Content-Type against body mediaType.
+          HTTP_STATUS=$(curl -s -D /tmp/stable_headers.txt -o /tmp/stable_manifest.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${GHCR_TOKEN}" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+            "$MANIFEST_URL" 2>/dev/null) || {
+            echo "FAIL: Could not read back stable tag" >&2
+            exit 1
+          }
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "FAIL: Could not read back stable tag (HTTP ${HTTP_STATUS})" >&2
+            exit 1
+          fi
+
+          # Validate Content-Type header and body mediaType agree.
+          # Reject absent/unsupported/inconsistent header/body and index/list.
+          STABLE_CONFIG_DIGEST=$(python3 -c "
+          import json, sys
+
+          ACCEPTED_MEDIA_TYPES = frozenset((
+              'application/vnd.docker.distribution.manifest.v2+json',
+              'application/vnd.oci.image.manifest.v1+json',
+          ))
+          REJECTED_MEDIA_TYPES = frozenset((
+              'application/vnd.docker.distribution.manifest.list.v2+json',
+              'application/vnd.oci.image.index.v1+json',
+          ))
+
+          def normalize_media_type(mt):
+              if not mt:
+                  return ''
+              return mt.strip().split(';')[0].strip().lower()
+
+          # Read and validate Content-Type from response headers.
+          try:
+              with open('/tmp/stable_headers.txt') as f:
+                  headers_raw = f.read()
+          except IOError as e:
+              print(f'PARSE_ERROR: cannot read headers: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          content_type = ''
+          for line in headers_raw.splitlines():
+              if line.lower().startswith('content-type:'):
+                  content_type = line.split(':', 1)[1].strip()
+                  break
+
+          header_mt = normalize_media_type(content_type)
+          if not header_mt:
+              print('REJECTED: missing or empty Content-Type header', file=sys.stderr)
+              sys.exit(1)
+          if header_mt in REJECTED_MEDIA_TYPES:
+              print(f'REJECTED: unsupported Content-Type: {header_mt}', file=sys.stderr)
+              sys.exit(1)
+          if header_mt not in ACCEPTED_MEDIA_TYPES:
+              print(f'REJECTED: unexpected Content-Type: {header_mt}', file=sys.stderr)
+              sys.exit(1)
+
+          # Parse manifest body.
+          try:
+              with open('/tmp/stable_manifest.json') as f:
+                  data = json.load(f)
+          except (json.JSONDecodeError, IOError) as e:
+              print(f'PARSE_ERROR: {e}', file=sys.stderr)
+              sys.exit(1)
+
+          # Body mediaType must be present and non-empty — no defaults.
+          body_mt_raw = data.get('mediaType')
+          if not body_mt_raw or not isinstance(body_mt_raw, str) or not body_mt_raw.strip():
+              print('REJECTED: manifest body missing or empty mediaType', file=sys.stderr)
+              sys.exit(1)
+
+          body_mt = normalize_media_type(body_mt_raw)
+
+          # Header Content-Type and body mediaType must agree.
+          if header_mt != body_mt:
+              print(f'REJECTED: Content-Type ({header_mt}) != body mediaType ({body_mt})', file=sys.stderr)
+              sys.exit(1)
+
+          # Reject manifest lists and indices — cannot verify single-artifact identity.
+          if body_mt in REJECTED_MEDIA_TYPES:
+              print(f'REJECTED: unsupported manifest type: {body_mt}', file=sys.stderr)
+              sys.exit(1)
+
+          # Accept Docker schema2 and OCI image manifests.
+          if body_mt not in ACCEPTED_MEDIA_TYPES:
+              print(f'REJECTED: unexpected manifest type: {body_mt}', file=sys.stderr)
+              sys.exit(1)
+
+          config = data.get('config', {})
+          digest = config.get('digest', '')
+          if not digest:
+              print('REJECTED: no config digest in manifest', file=sys.stderr)
+              sys.exit(1)
+          print(digest)
+          " 2>/tmp/stable_parse_err.txt) || {
+            STABLE_PARSE_ERR=$(cat /tmp/stable_parse_err.txt 2>/dev/null || echo "unknown parse error")
+            echo "FAIL: Could not parse stable manifest: ${STABLE_PARSE_ERR}" >&2
+            exit 1
+          }
+
+          if [ -z "$STABLE_CONFIG_DIGEST" ]; then
+            echo "FAIL: No config digest in stable manifest" >&2
+            exit 1
+          fi
+
+          if [ "$STABLE_CONFIG_DIGEST" != "${LOCAL_CONFIG_DIGEST}" ]; then
+            echo "FAIL: Stable tag config digest mismatch" >&2
+            echo "  Expected (local): ${LOCAL_CONFIG_DIGEST}" >&2
+            echo "  Stable: ${STABLE_CONFIG_DIGEST}" >&2
+            exit 1
+          fi
+
+          # Fetch config blob and verify revision label.
+          CONFIG_URL="https://ghcr.io/v2/${REPO}/blobs/${STABLE_CONFIG_DIGEST}"
+          curl -s -f -o /tmp/stable_config.json \
+            -H "Authorization: Bearer ${GHCR_TOKEN}" \
+            "$CONFIG_URL" || {
+            echo "FAIL: Could not fetch config blob of stable tag" >&2
+            exit 1
+          }
+
+          STABLE_REV=$(python3 -c "
+          import json, sys
+          try:
+              with open('/tmp/stable_config.json') as f:
+                  data = json.load(f)
+          except (json.JSONDecodeError, IOError) as e:
+              print(f'PARSE_ERROR: {e}', file=sys.stderr)
+              sys.exit(1)
+          labels = data.get('config', {}).get('Labels', {})
+          if not labels:
+              print('MISSING: no Labels in config', file=sys.stderr)
+              sys.exit(1)
+          rev = labels.get('org.opencontainers.image.revision', '')
+          if not rev:
+              print('MISSING: no org.opencontainers.image.revision label', file=sys.stderr)
+              sys.exit(1)
+          print(rev)
+          " 2>/tmp/stable_rev_err.txt) || {
+            STABLE_REV_ERR=$(cat /tmp/stable_rev_err.txt 2>/dev/null || echo "unknown error")
+            echo "FAIL: Could not extract revision from stable config blob: ${STABLE_REV_ERR}" >&2
+            exit 1
+          }
+
+          if [ "$STABLE_REV" != "${{ github.sha }}" ]; then
+            echo "FAIL: Stable tag revision mismatch" >&2
+            echo "  Expected: ${{ github.sha }}" >&2
+            echo "  Stable: ${STABLE_REV}" >&2
+            exit 1
+          fi
+
+          echo "Promoted stable tag verified: config_digest=${STABLE_CONFIG_DIGEST} revision=${STABLE_REV}"

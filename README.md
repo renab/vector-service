@@ -93,6 +93,7 @@ This repository owns:
 - vector-storage semantics
 - tests
 - container build
+- image publishing (GHCR)
 - service documentation
 
 Deployment infrastructure belongs elsewhere.
@@ -172,6 +173,42 @@ Vector Service
 ```
 
 Loss of the vector database must be recoverable from authoritative consumer-owned state.
+
+## Image Publishing
+
+The service container image is published to GitHub Container Registry (GHCR)
+for master pushes and can also be triggered manually via workflow_dispatch:
+
+```
+ghcr.io/renab/vector-service:sha-<commit>
+ghcr.io/renab/vector-service:stable
+```
+
+- `sha-<commit>` — commit-addressed tag bound to a specific source commit.
+  The workflow verifies the pushed artifact matches the locally verified
+  image by comparing config digests (rootfs identity) before promotion.
+  Protected against accidental workflow overwrite; not protected against
+  external writers (repository owners with packages:write scope may mutate
+  any tag).
+- `stable` — mutable tag promoted to the latest eligible successful master
+  publication.
+
+Images are published only after passing the full CI pipeline: unit tests,
+integration tests, and container image verification. The exact verified
+image is published — not a second rebuild.
+
+**Concurrency**: Master publishes are serialized. A newer push may supersede
+a pending run. The last eligible run that actually executes publishes its
+SHA tag and promotes stable. Runs that are superseded never publish. Every
+run that does execute publish creates its SHA tag.
+
+Pull requests and non-master branches do not publish images.
+
+Deployment repositories should pin by digest for production deployments
+and use `stable` for canary or development environments.
+
+For detailed publishing semantics and known limitations, see
+[`docs/PUBLISHING.md`](docs/PUBLISHING.md).
 
 ## Initial Vector Space
 
