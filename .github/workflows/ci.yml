@@ -1,0 +1,135 @@
+# CI — Vector Service
+#
+# On every push and pull request:
+#   1. Unit tests (no database)
+#   2. Integration tests (PostgreSQL 18 + pgvector):
+#      isolation matrix, migration matrix, logging matrix
+#   3. Container image build
+#
+# The integration matrix is release-critical: isolation, migration, and
+# logging tests run on every change, not only on scheduled runs.
+#
+# Technology pins (authoritative):
+#   - PostgreSQL: 18
+#   - pgvector: 0.8.6 (pgvector/pgvector:0.8.6-pg18-bookworm)
+#   - Go: 1.27.1 (golang:1.27.1-alpine3.23)
+
+name: CI
+
+on:
+  push:
+    branches-ignore: []
+  pull_request:
+
+# Cancel in-progress runs when a new commit is pushed to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Unit tests — no database, fast
+  # ──────────────────────────────────────────────────────────────────────────
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - name: Run unit tests
+        run: go test -v ./...
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Integration tests — PostgreSQL 18 + pgvector
+  # ──────────────────────────────────────────────────────────────────────────
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    services:
+      # PostgreSQL 18 + pgvector 0.8.6 (bookworm).
+      # This is the authoritative test infrastructure pin.
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg18-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 55432:5432
+        # Wait for PostgreSQL to accept connections.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Run integration tests
+        env:
+          VECTOR_SERVICE_TEST_PG_DSN: postgres://postgres@localhost:55432/postgres
+        # Serial package execution (-p 1): integration tests share fixed
+        # cluster-global roles (vector_api, vector_owner) and a single
+        # database cluster, so parallel package execution causes cross-test
+        # interference.
+        run: go test -p 1 -tags=integration -v ./...
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Container image build and verification
+  # ──────────────────────────────────────────────────────────────────────────
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    services:
+      # PostgreSQL for image verification (migrate + serve checks).
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg18-bookworm
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+          --add-host host.docker.internal:host-gateway
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+
+      - name: Build container image
+        run: docker build -t vector-service:test .
+
+      - name: Verify container image
+        env:
+          PG_HOST: 127.0.0.1
+          PG_PORT: 55432
+          VECTOR_SERVICE_IMAGE_TEST_DISPOSABLE: "1"
+        run: bash scripts/verify-image.sh vector-service:test

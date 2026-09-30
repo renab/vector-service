@@ -1,0 +1,13 @@
+# Compiled Go binaries
+*.test
+/vector-service
+
+# Downloaded packages
+*.deb
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Agent tool caches
+.omo/

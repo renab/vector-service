@@ -488,6 +488,70 @@ If external exposure is added later, it requires a deliberate security review co
 
 ---
 
+# Bootstrap & Authentication Constraints
+
+## Trust-Only Bootstrap
+
+The administrative bootstrap process (application registration, credential creation)
+relies on a single high-entropy admin token (`VEC_ADMIN_TOKEN`). This token is the
+sole administrative credential: there is no password-based authentication, no
+multi-admin model, and no credential recovery mechanism.
+
+This design assumes:
+
+- The admin token is generated once and injected through deployment infrastructure
+- The token is loaded from the environment variable at startup and compared in memory
+- The token is not persisted (no digest stored in the database)
+- Loss of the admin token requires regeneration and updating deployment infrastructure
+
+## No Password Support
+
+Vector Service does not support password-based authentication for any purpose:
+
+- Application credentials are opaque, high-entropy machine-generated tokens
+- Administrative authentication uses a single admin token
+- PostgreSQL connections use TLS client certificates or plain mode (no password transport)
+- There is no password reset, password recovery, or password-based login
+
+This eliminates:
+
+- Password brute-force attacks
+- Password spraying
+- Credential stuffing
+- Password policy management complexity
+
+## Admin Token Security
+
+The admin token must be:
+
+- At least 32 bytes of high-entropy random data
+- Injected through deployment infrastructure (environment variable, secret mount)
+- Never logged, never returned in API responses, never included in error messages
+- Compared in memory at request time (no digest persistence in the database)
+
+### Rotation
+
+To rotate the admin token:
+
+1. Generate a new high-entropy token.
+2. Update the `VEC_ADMIN_TOKEN` environment variable in deployment infrastructure.
+3. Restart the service to load the new token.
+
+The old token becomes invalid immediately upon restart; there is no grace period.
+
+### Recovery
+
+If the admin token is lost:
+
+1. Generate a new token.
+2. Update the `VEC_ADMIN_TOKEN` environment variable in deployment infrastructure.
+3. Restart the service.
+
+Because the token is not persisted in the database, there is no database-level
+recovery required. The new token replaces the old one entirely.
+
+---
+
 # Threat Model Summary
 
 The service must protect against:

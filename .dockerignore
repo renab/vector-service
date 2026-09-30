@@ -1,0 +1,55 @@
+# Git
+.git/
+.gitignore
+
+# Documentation (not needed in build context)
+docs/
+AGENTS.md
+
+# Test binaries and artifacts
+*.test
+*.deb
+strace_*.deb
+
+# Compiled binary (not needed — builder produces a fresh one)
+vector-service
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local overrides
+.env
+.env.*
+
+# Container verification script (not needed in image)
+scripts/verify-image.sh
+
+# GitHub Actions (not needed in image)
+.github/
+
+# Integration test directory (tests are not baked into the image)
+integration/
+
+# Internal test harness (not needed in the runtime image)
+internal/testdb/
+
+# Migrations directory (migrations are embedded in the binary via embed.go)
+# The embed directive in internal/migrate/source.go reads from this directory,
+# so it IS needed during the build. Do NOT exclude it.
+
+# Go-related
+vendor/
+
+# Go test files (not needed in the runtime image)
+*_test.go
+
+# Build cache
+cache/
