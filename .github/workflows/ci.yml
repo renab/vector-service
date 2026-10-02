@@ -423,8 +423,8 @@ jobs:
 
               # Fetch config blob to verify revision label.
               CONFIG_URL="https://ghcr.io/v2/${REPO}/blobs/${REMOTE_CONFIG_DIGEST}"
-              CONFIG_HTTP=$(curl -s -o /tmp/config_blob.json -w "%{http_code}" \
-                -H "Authorization: Bearer ${GHCR_TOKEN}" \
+              CONFIG_HTTP=$(curl -s --location --max-redirs 5 --proto-redir '=https' \
+                --oauth2-bearer "${GHCR_TOKEN}" -o /tmp/config_blob.json -w "%{http_code}" \
                 "$CONFIG_URL" 2>/dev/null) || {
                 echo "FAIL: Could not fetch config blob" >&2
                 exit 1
@@ -702,8 +702,8 @@ jobs:
 
           # Fetch config blob and verify revision label.
           CONFIG_URL="https://ghcr.io/v2/${REPO}/blobs/${PUSHED_CONFIG_DIGEST}"
-          curl -s -f -o /tmp/pushed_config.json \
-            -H "Authorization: Bearer ${GHCR_TOKEN}" \
+          curl -s -f --location --max-redirs 5 --proto-redir '=https' \
+            --oauth2-bearer "${GHCR_TOKEN}" -o /tmp/pushed_config.json \
             "$CONFIG_URL" || {
             echo "FAIL: Could not fetch config blob of pushed SHA tag" >&2
             exit 1
@@ -893,8 +893,8 @@ jobs:
 
           # Fetch config blob and verify revision label.
           CONFIG_URL="https://ghcr.io/v2/${REPO}/blobs/${STABLE_CONFIG_DIGEST}"
-          curl -s -f -o /tmp/stable_config.json \
-            -H "Authorization: Bearer ${GHCR_TOKEN}" \
+          curl -s -f --location --max-redirs 5 --proto-redir '=https' \
+            --oauth2-bearer "${GHCR_TOKEN}" -o /tmp/stable_config.json \
             "$CONFIG_URL" || {
             echo "FAIL: Could not fetch config blob of stable tag" >&2
             exit 1
