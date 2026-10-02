@@ -8,7 +8,7 @@ This document describes the GHCR image publishing workflow, its semantics, guara
 |-----|---------|------------|
 | `sha-<commit>` | Commit-addressed tag bound to a specific source commit | Mutable by any writer; protected against accidental workflow overwrite |
 | `stable` | Mutable tag promoted to the latest successfully validated master commit | Mutable by any writer |
-| `staging-<run_id>-<attempt>` | Ephemeral bootstrap tag created on first publication to initialize the GHCR package | Persists after creation; harmless artifact |
+| `staging-<run_id>-<attempt>` | Unique tag used to initialize or verify GHCR package access after an ambiguous 404 | Persists after creation; harmless artifact |
 
 ## Publishing Flow
 
@@ -57,8 +57,9 @@ The response is classified as follows:
 | HTTP Status | Error Code | Meaning | Action |
 |-------------|------------|---------|--------|
 | 200 | — | Tag exists | Verify artifact identity (step 4a) |
-| 404 | MANIFEST_UNKNOWN | Tag does not exist | Proceed to push (step 5) |
-| 404 | NAME_UNKNOWN | Repository does not exist | Bootstrap with staging tag (step 4b) |
+| 404 | MANIFEST_UNKNOWN | Tag does not exist; repository is visible | Eligible to proceed to push (step 5) |
+| 404 | NAME_UNKNOWN | Repository does not exist | Bootstrap with staging tag (step 4b), then resolve again |
+| 404 | Empty body | GHCR may omit the error body for either an absent tag or package | Bootstrap with staging tag (step 4b), verify access, then resolve again; eligible to push only if the authenticated re-resolution is still empty |
 | 401 | — | Authentication failed | **Fail** |
 | 403 | — | Access denied | **Fail** |
 | 429 | — | Rate limited | **Fail** |
@@ -99,9 +100,8 @@ If both match, the push is skipped.
 
 #### 4b. Bootstrap with staging tag
 
-On first publication, the GHCR package does not yet exist. Attempting to
-resolve the SHA tag returns 404 with `NAME_UNKNOWN`. The workflow creates
-the package by pushing a unique staging tag:
+When the SHA lookup returns `NAME_UNKNOWN` or an empty 404 body, package
+visibility is ambiguous. The workflow pushes a unique staging tag:
 
 ```
 staging-<run_id>-<attempt>
@@ -109,17 +109,25 @@ staging-<run_id>-<attempt>
 
 This tag is derived from the GitHub Actions run ID and attempt number,
 making it unique per workflow execution. After the staging tag is pushed,
-the workflow proceeds to push the SHA tag (which now resolves to
-`MANIFEST_UNKNOWN` rather than `NAME_UNKNOWN`).
+the workflow reads it back using the scoped registry token and checks its
+config digest against the locally verified image. The push confirms write
+permission and the authenticated read-back confirms package visibility.
+Only then does the workflow resolve the SHA tag again. If it exists, its
+identity is verified as described in step 4a; if the SHA lookup returns
+`MANIFEST_UNKNOWN`, or an empty 404 after this unique staging tag was pushed
+and its authenticated read-back proved package visibility, the tag is
+considered absent and may be pushed. An initial empty 404 alone is never
+eligible for push. Any contradictory package error fails closed.
 
-The staging tag persists after creation. It is a harmless one-time artifact
-of package initialization. It may be manually deleted via the GitHub
-Packages UI if desired.
+The staging tag persists after creation. It is a harmless artifact of package
+initialization or access verification. It may be manually deleted via the
+GitHub Packages UI if desired.
 
 ### 5. Push SHA tag
 
-If the tag does not exist (MANIFEST_UNKNOWN), push the `sha-<commit>` tag.
-After push, read back the tag via the OCI Registry API and verify:
+If the tag does not exist (`MANIFEST_UNKNOWN`, or an empty 404 only after the
+staging push and authenticated read-back described in step 4b), push the
+`sha-<commit>` tag. After push, read back the tag via the OCI Registry API and verify:
 
 1. The manifest config digest matches the local verified image config digest
 2. The config blob revision label matches the expected commit SHA
@@ -134,8 +142,12 @@ back the stable tag via the OCI Registry API and verify:
 1. The manifest config digest matches the local verified image config digest
    (same as the SHA tag's config digest)
 2. The config blob revision label matches the expected commit SHA
+3. `Docker-Content-Digest` is a valid SHA-256 digest and matches the SHA-256
+   hash of the raw manifest response body
 
-Both checks must pass. If either fails, the workflow fails.
+All checks must pass. If any fails, the workflow fails. The workflow records
+the immutable manifest-digest deployment reference in `GITHUB_STEP_SUMMARY`
+from this same verified post-push response.
 
 ## Guarantees
 
@@ -155,18 +167,29 @@ The following guarantees are provided:
 
 4. **Post-push read-back verification**: After pushing the SHA tag and
    promoting the stable tag, each is read back via the OCI Registry API
-   and verified to have the correct config digest and revision label.
+   and verified to have the correct config digest and revision label. The
+   stable-tag response's manifest digest is syntax-checked and matched against
+   the raw response body; its immutable deployment reference is recorded in
+   the workflow step summary.
 
 5. **Fail-closed on errors**: Any authentication, transport, or parse
-   failure stops the workflow. The workflow never treats an error as
-   "tag absent."
+   failure stops the workflow. An empty 404 is treated as "tag absent" only
+   after a unique staging tag proves package write access and authenticated
+   read-back proves package visibility.
 
 6. **Serialized master publishing**: Concurrency configuration serializes
    master publishes, preventing concurrent workflow publishers from racing.
 
-7. **Protected against accidental workflow overwrite**: The workflow checks
-   for an existing SHA tag before pushing. If the tag exists with a
-   different config digest, the workflow fails rather than overwriting.
+7. **Protected against accidental workflow overwrite**: The workflow resolves
+   and verifies an existing SHA tag before pushing that SHA tag. An ambiguous
+   lookup may first require pushing a unique staging tag to establish package
+   visibility; that staging push is not preceded by the SHA-tag check.
+
+8. **Limited SHA-tag guarantee**: These checks prevent non-concurrent
+   accidental workflow overwrite and detect mismatches at verification time.
+   GHCR does not provide atomic create-only tag publication; other authorized
+   package writers are not serialized and can race with checks or mutate tags
+   afterward. Neither `sha-<commit>` nor `stable` is immutable.
 
 ## Known Limitations
 
@@ -247,18 +270,24 @@ faster feedback. They do not publish images.
 
 ### Production deployments
 
-Pin by digest rather than by tag:
+Pin the verified build's manifest content digest, not a mutable tag:
 
 ```yaml
-image: ghcr.io/renab/vector-service@sha256:<digest>
+image: ghcr.io/renab/vector-service@sha256:<manifest-digest>
 ```
 
-The digest can be obtained from the GitHub Actions workflow run logs or by
-inspecting the published tag:
+The workflow records the immutable deployment reference in the GitHub Actions
+step summary. It captures `Docker-Content-Digest` from the authenticated
+post-push stable-tag manifest response whose config digest and revision label
+were verified, validates its SHA-256 syntax, and verifies it matches the hash
+of the raw manifest response body. Use this recorded reference for production;
+do not resolve a mutable SHA or `stable` tag later and assume it still
+represents the verified build.
 
-```bash
-docker manifest inspect ghcr.io/renab/vector-service:sha-<commit>
-```
+The config digest printed by `docker inspect --format '{{.Id}}'` is the image
+config blob digest used for identity verification; it is not the deployable
+manifest digest. If the recorded manifest digest's association with the
+verified build cannot be established, reverify before deployment.
 
 ### Development/canary environments
 

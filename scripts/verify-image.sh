@@ -775,14 +775,14 @@ else
 fi
 
 # 4d-ii. Strict filesystem allowlist: the runtime image should only contain
-# files from the distroless static-debian13:nonroot base plus our binary.
+# files from the distroless static-debian12:nonroot base plus our binary.
 # We establish the expected filesystem by extracting the exact base image
 # (pinned by digest) and comparing against our image using Python's tarfile
 # module for precise comparison of each path, type, mode, uid/gid, symlink
 # target, and regular-file content SHA256.
 
 # Pinned base image digest (must match Dockerfile).
-BASE_IMAGE="gcr.io/distroless/static-debian13:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7"
+BASE_IMAGE="gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab"
 
 # Extract the base image filesystem.
 BASE_CONTAINER=$(docker create "$BASE_IMAGE" cat)

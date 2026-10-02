@@ -42,8 +42,8 @@ PostgreSQL + pgvector (overview invariant 14; `DEVELOPMENT.md`).
   `pgvector/pgvector:0.8.6-pg18-bookworm` (PostgreSQL 18 + pgvector 0.8.6).
 - Go builder: `golang:1.27.1-alpine3.23` (matches `go.mod`).
 - Distroless runtime:
-  `gcr.io/distroless/static-debian13:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7`
-  (Debian 13, nonroot, static binary; pinned by digest).
+  `gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab`
+  (Debian 12, nonroot, static binary; pinned by digest).
 
 ---
 
@@ -214,7 +214,7 @@ This produces a two-stage image:
 
 - **Stage 1 (builder):** `golang:1.27.1-alpine3.23` with `CGO_ENABLED=0`
   producing a fully static binary at `/out/vector-service`.
-- **Stage 2 (runtime):** `gcr.io/distroless/static-debian13:nonroot`
+- **Stage 2 (runtime):** `gcr.io/distroless/static-debian12:nonroot`
   containing only the binary at `/usr/local/bin/vector-service`, running
   as `nonroot` (UID 65532), with `ENTRYPOINT ["/usr/local/bin/vector-service"]`
   and `CMD ["serve"]`.
@@ -312,8 +312,9 @@ The script performs the following steps:
    - Runtime user effective UID is non-root (resolved from /etc/passwd).
    - Strict filesystem allowlist: the built image's filesystem is compared
      against the pinned distroless base image
-     (`gcr.io/distroless/static-debian13:nonroot@sha256:...`). The only
-     expected difference is the binary at `/usr/local/bin/vector-service`.
+      (`gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab`).
+      The only expected difference is the binary at
+      `/usr/local/bin/vector-service`.
      Any extra files or missing base files cause failure.
    - Filesystem metadata comparison: each base file's type, mode, uid, and
      gid are compared against the image's corresponding entry. A mismatch

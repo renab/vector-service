@@ -13,11 +13,12 @@
 # GHCR publish:
 #   - Only for master pushes or manual workflow_dispatch on master.
 #   - Publishes the exact locally verified image (not a second rebuild).
-#   - sha-<commit> tag is commit-addressed: the workflow verifies the pushed
-#     artifact matches the locally verified image by comparing config digests
-#     (rootfs identity) before promotion. Protected against accidental workflow
-#     overwrite; not protected against external writers (repository owners with
-#     packages:write may mutate any tag).
+#   - Before pushing a sha-<commit> tag, the workflow resolves/verifies any
+#     existing tag against the locally verified image; an ambiguous lookup may
+#     first require a unique staging-tag push to establish package visibility.
+#     The post-push artifact is verified by config digest (rootfs identity)
+#     before promotion. Protected against accidental workflow overwrite, not
+#     external writers (repository owners with packages:write may mutate tags).
 #   - stable tag promoted after SHA tag verification.
 #   - Serialized master concurrency prevents concurrent workflow publishers.
 #     A newer master push may supersede (cancel) a pending run; only runs that
@@ -61,15 +62,18 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "1.27.1"
           cache: true
+
+      - name: Test GHCR error response parsing
+        run: python3 scripts/test_ghcr_error_code.py
 
       - name: Run unit tests
         run: go test -v ./...
@@ -100,12 +104,12 @@ jobs:
           --health-start-period 30s
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "1.27.1"
           cache: true
@@ -148,12 +152,12 @@ jobs:
           --add-host host.docker.internal:host-gateway
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: "1.27.1"
 
@@ -179,7 +183,7 @@ jobs:
         run: docker save vector-service:test -o image.tar
 
       - name: Upload image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: vector-service-image
           path: image.tar
@@ -206,7 +210,7 @@ jobs:
       packages: write
     steps:
       - name: Download image artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: vector-service-image
 
@@ -274,14 +278,16 @@ jobs:
             exit 1
           fi
 
+          echo "::add-mask::${GHCR_TOKEN}"
           echo "GHCR_TOKEN=${GHCR_TOKEN}" >> "$GITHUB_ENV"
 
       - name: Resolve and verify SHA tag
         # Resolve existing SHA tag via authenticated OCI Registry HTTP API.
-        # Distinguish MANIFEST_UNKNOWN (tag absent) from NAME_UNKNOWN (repo absent).
-        # Fail closed: any non-MANIFEST_UNKNOWN error stops the workflow.
-        # When tag exists, verify config digest identity and revision label.
-        # When repo is absent (NAME_UNKNOWN), bootstrap with staging tag.
+        # GHCR can return an empty-body 404 for either a missing repository or
+        # tag. Bootstrap ambiguous responses using a unique staging tag, verify
+        # authenticated visibility, then resolve the SHA tag again. Resolve and
+        # verify the SHA tag before pushing that SHA tag; staging bootstrap may
+        # occur first.
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           REPO="${OWNER}/vector-service"
@@ -301,6 +307,8 @@ jobs:
             exit 1
           }
 
+          BOOTSTRAPPED=false
+          while true; do
           case "$HTTP_STATUS" in
             200)
               echo "Tag exists (HTTP 200) — verifying artifact identity."
@@ -457,37 +465,80 @@ jobs:
               fi
               ;;
             404)
-              # Parse error body to distinguish MANIFEST_UNKNOWN from NAME_UNKNOWN.
-              ERROR_CODE=$(python3 -c "
-              import json, sys
-              try:
-                  with open('/tmp/manifest_response.json') as f:
-                      data = json.load(f)
-                  errors = data.get('errors', [])
-                  if errors:
-                      print(errors[0].get('code', ''))
-                  else:
-                      print('')
-              except:
-                  print('')
-              " 2>/dev/null) || ERROR_CODE=""
+              ERROR_CODE=$(python3 scripts/ghcr_error_code.py /tmp/manifest_response.json) || {
+                echo "FAIL: Invalid 404 response body from registry" >&2
+                exit 1
+              }
 
               if [ "$ERROR_CODE" = "MANIFEST_UNKNOWN" ]; then
                 echo "Tag does not exist (MANIFEST_UNKNOWN) — will push."
-              elif [ "$ERROR_CODE" = "NAME_UNKNOWN" ]; then
-                # Repository does not exist — bootstrap with a unique staging tag
-                # to create the package before pushing the SHA tag.
+              elif [ "$ERROR_CODE" = "NAME_UNKNOWN" ] || [ "$ERROR_CODE" = "EMPTY" ]; then
+                if [ "$BOOTSTRAPPED" = true ]; then
+                  if [ "$ERROR_CODE" = "EMPTY" ]; then
+                    # The staging tag was read back successfully, proving this
+                    # package is visible with the current token. GHCR's blank
+                    # 404 now unambiguously means this SHA tag is absent.
+                    echo "SHA tag is absent (blank 404 after verified staging access) — will push."
+                    break
+                  fi
+                  echo "FAIL: Registry reports package missing after staging tag was visible" >&2
+                  exit 1
+                fi
+
+                # An empty 404 is ambiguous on GHCR. A unique staging push
+                # proves package write access; an authenticated read-back
+                # proves package visibility before we classify the SHA tag.
                 STAGING_TAG="staging-${{ github.run_id }}-${{ github.run_attempt }}"
-                echo "Repository does not exist (NAME_UNKNOWN) — creating with staging tag: ${STAGING_TAG}"
+                echo "Ambiguous 404 (${ERROR_CODE}) — bootstrapping/checking package with staging tag: ${STAGING_TAG}"
 
                 docker tag vector-service:test \
                   "ghcr.io/${OWNER}/vector-service:${STAGING_TAG}" &&
                 docker push "ghcr.io/${OWNER}/vector-service:${STAGING_TAG}"
 
+                STAGING_URL="https://ghcr.io/v2/${REPO}/manifests/${STAGING_TAG}"
+                STAGING_HTTP=$(curl -s -o /tmp/staging_manifest.json -w "%{http_code}" \
+                  -H "Authorization: Bearer ${GHCR_TOKEN}" \
+                  -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+                  "$STAGING_URL" 2>/dev/null) || {
+                  echo "FAIL: Could not verify staging tag visibility" >&2
+                  exit 1
+                }
+                if [ "$STAGING_HTTP" != "200" ]; then
+                  echo "FAIL: Staging tag is not visible to registry token (HTTP ${STAGING_HTTP})" >&2
+                  exit 1
+                fi
+
+                STAGING_CONFIG_DIGEST=$(python3 -c "
+                import json, sys
+                try:
+                    with open('/tmp/staging_manifest.json') as f:
+                        data = json.load(f)
+                    print(data.get('config', {}).get('digest', ''))
+                except (json.JSONDecodeError, OSError):
+                    sys.exit(1)
+                " 2>/dev/null) || {
+                  echo "FAIL: Could not parse staging manifest" >&2
+                  exit 1
+                }
+                if [ "$STAGING_CONFIG_DIGEST" != "${LOCAL_CONFIG_DIGEST}" ]; then
+                  echo "FAIL: Staging tag does not identify the verified local image" >&2
+                  exit 1
+                fi
+
                 echo "STAGING_TAG=${STAGING_TAG}" >> "$GITHUB_ENV"
-                echo "Repository created — will push SHA tag."
+                BOOTSTRAPPED=true
+
+                # Verify whether the SHA tag appeared while bootstrapping;
+                # never assume an ambiguous first response means it is absent.
+                HTTP_STATUS=$(curl -s -D /tmp/manifest_headers.txt -o /tmp/manifest_response.json -w "%{http_code}" \
+                  -H "Authorization: Bearer ${GHCR_TOKEN}" \
+                  -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+                  "$MANIFEST_URL" 2>/dev/null) || {
+                  echo "FAIL: Could not re-resolve SHA tag after staging bootstrap" >&2
+                  exit 1
+                }
+                continue
               else
-                # 404 without expected error code — fail closed.
                 echo "FAIL: Unexpected 404 response from registry (error code: '${ERROR_CODE}')" >&2
                 exit 1
               fi
@@ -513,6 +564,8 @@ jobs:
               exit 1
               ;;
           esac
+          break
+          done
 
       - name: Push SHA tag
         if: env.SHA_TAG_EXISTS != 'true'
@@ -714,8 +767,8 @@ jobs:
 
           # Validate Content-Type header and body mediaType agree.
           # Reject absent/unsupported/inconsistent header/body and index/list.
-          STABLE_CONFIG_DIGEST=$(python3 -c "
-          import json, sys
+          STABLE_MANIFEST_PARSE=$(python3 -c "
+          import hashlib, json, re, sys
 
           ACCEPTED_MEDIA_TYPES = frozenset((
               'application/vnd.docker.distribution.manifest.v2+json',
@@ -731,7 +784,8 @@ jobs:
                   return ''
               return mt.strip().split(';')[0].strip().lower()
 
-          # Read and validate Content-Type from response headers.
+          # Read response headers, taking the last value if curl recorded
+          # interim or redirected response headers before the final response.
           try:
               with open('/tmp/stable_headers.txt') as f:
                   headers_raw = f.read()
@@ -739,11 +793,30 @@ jobs:
               print(f'PARSE_ERROR: cannot read headers: {e}', file=sys.stderr)
               sys.exit(1)
 
-          content_type = ''
-          for line in headers_raw.splitlines():
-              if line.lower().startswith('content-type:'):
-                  content_type = line.split(':', 1)[1].strip()
-                  break
+          def header_value(name):
+              values = [line.split(':', 1)[1].strip()
+                        for line in headers_raw.splitlines()
+                        if line.partition(':')[0].strip().lower() == name.lower()]
+              return values[-1] if values else ''
+
+          content_type = header_value('content-type')
+          manifest_digest = header_value('docker-content-digest')
+
+          # Verify that Docker-Content-Digest identifies these exact manifest
+          # bytes before using it as an immutable deployment reference.
+          if not re.fullmatch(r'sha256:[0-9a-f]{64}', manifest_digest):
+              print('REJECTED: missing or invalid Docker-Content-Digest', file=sys.stderr)
+              sys.exit(1)
+          try:
+              with open('/tmp/stable_manifest.json', 'rb') as f:
+                  manifest_body = f.read()
+          except IOError as e:
+              print(f'PARSE_ERROR: cannot read manifest body: {e}', file=sys.stderr)
+              sys.exit(1)
+          computed_digest = 'sha256:' + hashlib.sha256(manifest_body).hexdigest()
+          if manifest_digest != computed_digest:
+              print('REJECTED: Docker-Content-Digest does not match manifest body', file=sys.stderr)
+              sys.exit(1)
 
           header_mt = normalize_media_type(content_type)
           if not header_mt:
@@ -758,9 +831,8 @@ jobs:
 
           # Parse manifest body.
           try:
-              with open('/tmp/stable_manifest.json') as f:
-                  data = json.load(f)
-          except (json.JSONDecodeError, IOError) as e:
+              data = json.loads(manifest_body)
+          except (json.JSONDecodeError, UnicodeDecodeError) as e:
               print(f'PARSE_ERROR: {e}', file=sys.stderr)
               sys.exit(1)
 
@@ -788,19 +860,23 @@ jobs:
               sys.exit(1)
 
           config = data.get('config', {})
-          digest = config.get('digest', '')
-          if not digest:
-              print('REJECTED: no config digest in manifest', file=sys.stderr)
+          config_digest = config.get('digest', '')
+          if not isinstance(config_digest, str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', config_digest):
+              print('REJECTED: missing or invalid config digest in manifest', file=sys.stderr)
               sys.exit(1)
-          print(digest)
+          print(f'CONFIG_DIGEST={config_digest}')
+          print(f'MANIFEST_DIGEST={manifest_digest}')
           " 2>/tmp/stable_parse_err.txt) || {
             STABLE_PARSE_ERR=$(cat /tmp/stable_parse_err.txt 2>/dev/null || echo "unknown parse error")
             echo "FAIL: Could not parse stable manifest: ${STABLE_PARSE_ERR}" >&2
             exit 1
           }
 
-          if [ -z "$STABLE_CONFIG_DIGEST" ]; then
-            echo "FAIL: No config digest in stable manifest" >&2
+          STABLE_CONFIG_DIGEST=$(echo "$STABLE_MANIFEST_PARSE" | grep '^CONFIG_DIGEST=' | cut -d= -f2)
+          STABLE_MANIFEST_DIGEST=$(echo "$STABLE_MANIFEST_PARSE" | grep '^MANIFEST_DIGEST=' | cut -d= -f2)
+
+          if [ -z "$STABLE_CONFIG_DIGEST" ] || [ -z "$STABLE_MANIFEST_DIGEST" ]; then
+            echo "FAIL: Missing config or manifest digest in stable manifest" >&2
             exit 1
           fi
 
@@ -850,4 +926,15 @@ jobs:
             exit 1
           fi
 
-          echo "Promoted stable tag verified: config_digest=${STABLE_CONFIG_DIGEST} revision=${STABLE_REV}"
+          DEPLOYMENT_REF="ghcr.io/${OWNER}/vector-service@${STABLE_MANIFEST_DIGEST}"
+          {
+            echo "## Verified production deployment reference"
+            echo
+            echo "Verified immutable reference: ${DEPLOYMENT_REF}"
+            echo
+            echo "Deployable manifest digest: ${STABLE_MANIFEST_DIGEST} (Docker-Content-Digest, verified against the raw manifest response body)."
+            echo "Image config digest: ${STABLE_CONFIG_DIGEST} (matched the local config digest ${LOCAL_CONFIG_DIGEST}; docker inspect .Id reports this config digest, not the deployable manifest digest)."
+            echo "The same post-push response had this run's verified config digest and revision label. Use the immutable reference above for production, not later resolution of a mutable tag. If its association with this verified build is uncertain, reverify before deployment."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Promoted stable tag verified: config_digest=${STABLE_CONFIG_DIGEST} manifest_digest=${STABLE_MANIFEST_DIGEST} revision=${STABLE_REV}"

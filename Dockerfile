@@ -5,7 +5,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Go 1.27.1 Alpine builder — matches go.mod. CGO_ENABLED=0 for a fully static
 # binary (no libc, no musl, no runtime CGO dependency).
-FROM golang:1.27.1-alpine3.23 AS builder
+FROM golang:1.27.1-alpine3.23@sha256:0908ac9b9319e09d7c238aabe914e0395c51d63c4e3d0ae8c554fda9158a5769 AS builder
 
 WORKDIR /src
 
@@ -22,13 +22,13 @@ RUN CGO_ENABLED=0 go build -o /out/vector-service ./cmd/vector-service
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 2: Runtime
 # ──────────────────────────────────────────────────────────────────────────────
-# Distroless static (Debian 13, nonroot). Pinned by digest for reproducibility.
+# Distroless static (Debian 12, nonroot). Pinned by digest for reproducibility.
 # The image contains only the compiled binary — no shell, no toolchain, no
 # source, no migrations, no test artifacts, no secrets.
 #
 # TLS client certificates for PostgreSQL are mounted at runtime (files or a
 # projected volume), never baked into the image.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 
 COPY --from=builder /out/vector-service /usr/local/bin/vector-service
 
